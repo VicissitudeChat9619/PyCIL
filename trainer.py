@@ -2,6 +2,7 @@ import sys
 import logging
 import copy
 import torch
+from sklearn.metrics import confusion_matrix
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
@@ -18,6 +19,9 @@ def train(args):
         args["device"] = device
         _train(args)
 
+def get_confusion_matrix(y_pred,y_true):
+    # 完成多分类问题的混淆矩阵
+    return confusion_matrix(y_true, y_pred.T[0])
 
 def _train(args):
 
@@ -67,8 +71,29 @@ def _train(args):
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
-        cnn_accy, nme_accy = model.eval_task()
+        # cnn_accy, nme_accy = model.eval_task()
+        cnn_accy, nme_accy,y_pred_cnn, y_true_cnn,y_pred_nme, y_true_nme=model.eval_task()
         model.after_task()
+
+
+
+        ## confusion matrix output
+        # if task==0:
+        # y_pred,y_true=model._eval_cnn(model.test_loader)
+        y_pred,y_true=y_pred_cnn,y_true_cnn
+        logging.info(f"{y_pred.shape},{y_true.shape}")
+        confusion_matrix = get_confusion_matrix(y_pred,y_true)
+        logging.info("CNN confusion matrix:\n{}\n".format(confusion_matrix))
+        if task == data_manager.nb_tasks-1: # save at last iteration
+            np.savetxt(fname=logfilename + "CNN_cm.csv", X=confusion_matrix, delimiter=",")
+
+        if y_pred_nme is not None:
+            # y_pred,y_true=model._eval_nme(model.test_loader, model._class_means)
+            y_pred,y_true = y_pred_nme, y_true_nme
+            confusion_matrix=get_confusion_matrix(y_pred,y_true)
+            logging.info("NME confusion matrix:\n{}\n".format(confusion_matrix))
+            if task == data_manager.nb_tasks-1: # save at last iteration
+                np.savetxt(fname=logfilename + "NME_cm.csv", X=confusion_matrix, delimiter=",")
 
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -96,8 +121,8 @@ def _train(args):
             logging.info("NME top1 curve: {}".format(nme_curve["top1"]))
             logging.info("NME top5 curve: {}\n".format(nme_curve["top5"]))
 
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
-            print('Average Accuracy (NME):', sum(nme_curve["top1"])/len(nme_curve["top1"]))
+            logging.info('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
+            logging.info('Average Accuracy (NME):', sum(nme_curve["top1"])/len(nme_curve["top1"]))
 
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
@@ -116,7 +141,7 @@ def _train(args):
             logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
             logging.info("CNN top5 curve: {}\n".format(cnn_curve["top5"]))
 
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
+            logging.info('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
 
 
@@ -127,9 +152,10 @@ def _train(args):
             np_acctable[idxx, :idxy] = np.array(line)
         np_acctable = np_acctable.T
         forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
-        print('Accuracy Matrix (CNN):')
-        print(np_acctable)
-        print('Forgetting (CNN):', forgetting)
+        logging.info('Accuracy Matrix (CNN):')
+        np.savetxt(fname=logfilename + "CNN_acctable.csv", X=np_acctable, delimiter=",")
+        logging.info(np_acctable)
+        logging.info('Forgetting (CNN):', forgetting)
         logging.info('Forgetting (CNN): {}'.format(forgetting))
     if len(nme_matrix)>0:
         np_acctable = np.zeros([task + 1, task + 1])
@@ -138,9 +164,10 @@ def _train(args):
             np_acctable[idxx, :idxy] = np.array(line)
         np_acctable = np_acctable.T
         forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
-        print('Accuracy Matrix (NME):')
-        print(np_acctable)
-        print('Forgetting (NME):', forgetting)
+        logging.info('Accuracy Matrix (NME):')
+        np.savetxt(fname=logfilename + "NME_acctable.csv", X=np_acctable, delimiter=",")
+        logging.info(np_acctable)
+        logging.info('Forgetting (NME):', forgetting)
         logging.info('Forgetting (NME): {}'.format(forgetting))
 
 

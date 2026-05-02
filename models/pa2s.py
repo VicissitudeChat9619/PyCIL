@@ -134,7 +134,7 @@ class PASS(BaseLearner):
 
     def _compute_pass_loss(self,inputs, targets):
         logits = self._network(inputs)["logits"]
-        loss_clf = F.cross_entropy(logits/self.args["temp"], targets)
+        loss_clf = F.cross_entropy(logits/self.args["temp"], targets.long())
         
         if self._cur_task == 0:
             return logits, loss_clf, torch.tensor(0.), torch.tensor(0.)
@@ -189,16 +189,17 @@ class PASS(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)  
     
     def eval_task(self):
-        y_pred, y_true = self._eval_cnn(self.test_loader)
-        cnn_accy = self._evaluate(y_pred, y_true)
-
+        y_pred_cnn, y_true_cnn = self._eval_cnn(self.test_loader)
+        cnn_accy = self._evaluate(y_pred_cnn, y_true_cnn)
+        y_pred_nme=None
+        y_true_nme=None
         if hasattr(self, '_class_means'):
-            y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
-            nme_accy = self._evaluate(y_pred, y_true)
+            y_pred_nme, y_true_nme = self._eval_nme(self.test_loader, self._class_means)
+            nme_accy = self._evaluate(y_pred_nme, y_true_nme)
         elif hasattr(self, '_protos'):
             y_pred, y_true = self._eval_nme(self.test_loader, self._protos/np.linalg.norm(self._protos,axis=1)[:,None])
             nme_accy = self._evaluate(y_pred, y_true)            
         else:
             nme_accy = None
 
-        return cnn_accy, nme_accy
+        return cnn_accy, nme_accy,y_pred_cnn, y_true_cnn,y_pred_nme, y_true_nme

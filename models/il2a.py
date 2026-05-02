@@ -130,7 +130,7 @@ class IL2A(BaseLearner):
 
     def _compute_il2a_loss(self,inputs, targets):
         logits = self._network(inputs)["logits"]
-        loss_clf = F.cross_entropy(logits/self.args["temp"], targets)
+        loss_clf = F.cross_entropy(logits/self.args["temp"], targets.long())
         
         if self._cur_task == 0:
             return logits, loss_clf, torch.tensor(0.), torch.tensor(0.)
@@ -151,7 +151,7 @@ class IL2A(BaseLearner):
 
         proto_logits = self._semantic_aug(proto_logits,proto_targets,self.args["ratio"])
         
-        loss_proto = self.args["lambda_proto"] * F.cross_entropy(proto_logits/self.args["temp"], proto_targets)
+        loss_proto = self.args["lambda_proto"] * F.cross_entropy(proto_logits/self.args["temp"], proto_targets.long())
         return logits, loss_clf, loss_fkd, loss_proto
         
     

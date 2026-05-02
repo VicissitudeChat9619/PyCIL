@@ -2,3 +2,9 @@ data/
 __pycache__/
 logs/
 .vscode/
+logic.md
+*.json
+*.md
+exp/
+*.pkl
+myexp/
