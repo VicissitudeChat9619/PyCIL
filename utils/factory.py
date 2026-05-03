@@ -20,7 +20,7 @@ def get_model(model_name, args):
         return WA(args)
     elif name == "der_a":
         from models.der import DER_A
-        return DER(args)
+        return DER_A(args)
     elif name == "der":
         from models.der import DER
         return DER(args)
