@@ -881,13 +881,15 @@ class DER_KL(DER):
         
         # 历史特征提取器数量（不包含最新的）
         num_historical = len(self._network.convnets) - 1
-        # 旧路径特征维度
+        # 旧路径特征维度 = 历史convnets数量 * 单个convnet输出维度
         old_feature_dim = self._network.out_dim * num_historical
         
         logging.info("-" * 50)
         logging.info(f"KL Divergence Analysis (T={T})")
         logging.info(f"  Historical convnets: {num_historical}")
         logging.info(f"  All convnets: {len(self._network.convnets)}")
+        logging.info(f"  Old feature dim: {old_feature_dim}")
+        logging.info(f"  Full feature dim: {self._network.feature_dim}")
         logging.info("-" * 50)
         
         # 旧类别数量
@@ -905,23 +907,26 @@ class DER_KL(DER):
                     features_old.append(feat)
                 features_old = torch.cat(features_old, dim=1)  # (N, old_feature_dim)
                 
-                # 使用 fc 的旧权重部分（不包含新特征提取器对应的权重）
-                old_weight_part = old_fc_weight[:num_old_classes, :old_feature_dim]
-                old_bias_part = old_fc_bias[:num_old_classes]
-                
-                # 计算旧路径 logits（只取旧类别部分）
-                logits_old = torch.mm(features_old, old_weight_part.t()) + old_bias_part
-                
                 # ========== 新路径 ==========
                 # 使用所有特征提取器（包含新的 convnets）
                 features_new = []
                 for convnet in self._network.convnets:
                     feat = convnet(inputs)["features"]
                     features_new.append(feat)
-                features_new = torch.cat(features_new, dim=1)
+                features_new = torch.cat(features_new, dim=1)  # (N, full_feature_dim)
                 
-                # 计算新路径 logits（只取旧类别部分）
-                logits_new = self._network.fc(features_new)["logits"][:, :num_old_classes]
+                # ========== 计算 logits（使用旧路径特征维度对应的权重部分）==========
+                # 旧路径 logits：只取旧类别部分，只使用历史特征维度对应的权重
+                old_weight_part = old_fc_weight[:num_old_classes, :old_feature_dim]
+                old_bias_part = old_fc_bias[:num_old_classes]
+                logits_old = torch.mm(features_old, old_weight_part.t()) + old_bias_part  # (N, num_old_classes)
+                
+                # 新路径 logits：使用全fc层，但只取旧类别部分
+                # 注意：fc权重的前 old_feature_dim 列对应历史特征
+                # 但fc对完整特征操作，我们只取旧类别部分
+                new_weight_for_old_classes = self._network.fc.weight[:num_old_classes, :old_feature_dim]
+                new_bias_for_old_classes = self._network.fc.bias[:num_old_classes]
+                logits_new = torch.mm(features_old, new_weight_for_old_classes.t()) + new_bias_for_old_classes  # (N, num_old_classes)
                 
                 # 应用温度缩放的 softmax
                 p_old = F.softmax(logits_old / T, dim=-1)
