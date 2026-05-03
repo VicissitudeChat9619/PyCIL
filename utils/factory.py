@@ -18,6 +18,12 @@ def get_model(model_name, args):
     elif name == "wa":
         from models.wa import WA
         return WA(args)
+    elif name == "der_svd":
+        from models.der import DER_SVD
+        return DER_SVD(args)
+    elif name == "der_kl":
+        from models.der import DER_KL
+        return DER_KL(args)
     elif name == "der_a":
         from models.der import DER_A
         return DER_A(args)
