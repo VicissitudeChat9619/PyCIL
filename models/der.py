@@ -407,7 +407,7 @@ class DER_SVD(DER):
         
         # 额外信息：奇异值分布
         top_k = min(5, len(s))
-        top_singular_values = s[:top_k].cpu().numpy()
+        top_singular_values = s[:top_k].detach().cpu().numpy()
         
         logging.info("-" * 50)
         logging.info(f"SVD Analysis for Convnet[{len(self._network.convnets)-1}]")
