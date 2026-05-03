@@ -347,99 +347,29 @@ class DER_A(DER):
     DER with CKA-based Dynamic Expansion
     
     基于 CKA (Centered Kernel Alignment) 的动态扩展机制：
-    - 训练完新的特征提取器后，计算其与上一阶段提取器的 CKA 相似度
+    - 阶段1训练完新的特征提取器后，计算其与上一阶段提取器的 CKA 相似度
     - 若 CKA > threshold：判定为冗余，丢弃新的特征提取器
-    - 若 CKA <= threshold：判定为有效新增，保留并执行后续剪枝
+    - 若 CKA <= threshold：判定为有效新增，保留
+    - 阶段2继续训练 fc（分类器）
     """
     def __init__(self, args):
         super().__init__(args)
-        # CKA 阈值：超过此值则判定为冗余
         self.cka_threshold = args.get('cka_threshold', 0.85)
-        self._temp_convnet = None  # 临时保存训练后的新骨干
         logging.info(f"CKA threshold: {self.cka_threshold}")
 
-    def incremental_train(self, data_manager):
-        self._cur_task += 1
-        self._total_classes = self._known_classes + data_manager.get_task_size(
-            self._cur_task
-        )
-        
-        # 记录当前 convnets 数量
-        num_convnets_before = len(self._network.convnets)
-        
-        self._network.update_fc(self._total_classes)
-        
-        # 保存新添加的 convnet 的引用（用于 CKA 检测）
-        if len(self._network.convnets) > num_convnets_before:
-            self._temp_convnet = self._network.convnets[-1]
-        
-        logging.info(
-            "Learning on {}-{}".format(self._known_classes, self._total_classes)
-        )
-
-        if self._cur_task > 0:
-            for i in range(self._cur_task):
-                for p in self._network.convnets[i].parameters():
-                    p.requires_grad = False
-
-        logging.info("All params: {}".format(count_parameters(self._network)))
-        logging.info(
-            "Trainable params: {}".format(count_parameters(self._network, True))
-        )
-
-        train_dataset = data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="train",
-            mode="train",
-            appendent=self._get_memory(),
-        )
-        self.train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, num_workers=self._num_workers
-        )
-        test_dataset = data_manager.get_dataset(
-            np.arange(0, self._total_classes), source="test", mode="test"
-        )
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, num_workers=self._num_workers
-        )
-
-        if len(self._multiple_gpus) > 1:
-            self._network = nn.DataParallel(self._network, self._multiple_gpus)
-        
-        self._train(self.train_loader, self.test_loader)
-        
-        # ========== CKA-based Dynamic Expansion ==========
-        self._apply_cka_discard()
-        
-        self.build_rehearsal_memory(data_manager, self.samples_per_class)
-        if len(self._multiple_gpus) > 1:
-            self._network = self._network.module
-
-    def _apply_cka_discard(self):
+    def _compute_cka_similarity(self, data_loader):
         """
-        计算训练后新骨干与上一个骨干的 CKA 相似度，
-        如果高于阈值则丢弃新的骨干
+        计算新骨干与上一个骨干的 CKA 相似度
         """
-        if self._cur_task == 0 or self._temp_convnet is None:
-            self._temp_convnet = None
-            return
-        
-        # 需要比较的骨干索引
         if len(self._network.convnets) < 2:
-            self._temp_convnet = None
-            return
+            return 0.0
         
-        # 获取当前任务的数据用于提取特征
-        eval_loader = self.test_loader
-        
-        # 提取特征
+        self._network.eval()
         features_prev = []
         features_curr = []
         
-        self._network.eval()
-        
         with torch.no_grad():
-            for _, (_, inputs, _) in enumerate(eval_loader):
+            for _, (_, inputs, _) in enumerate(data_loader):
                 inputs = inputs.to(self._device)
                 
                 # 提取前一个骨干的特征
@@ -453,68 +383,180 @@ class DER_A(DER):
         features_prev = torch.cat(features_prev, dim=0)
         features_curr = torch.cat(features_curr, dim=0)
         
-        # 如果特征维度不同，使用全局平均池化对齐
+        # 如果特征维度不同，对齐到相同维度
         if features_prev.shape[1] != features_curr.shape[1]:
-            # 对齐到相同维度
             min_dim = min(features_prev.shape[1], features_curr.shape[1])
             features_prev = features_prev[:, :min_dim]
             features_curr = features_curr[:, :min_dim]
         
-        # 随机采样一部分特征计算 CKA（避免显存问题）
+        # 随机采样计算 CKA
         max_samples = 1000
         if len(features_prev) > max_samples:
             indices = torch.randperm(len(features_prev))[:max_samples]
             features_prev = features_prev[indices]
             features_curr = features_curr[indices]
         
-        # 计算 CKA
-        cka_score = compute_cka(features_prev, features_curr)
-        
+        return compute_cka(features_prev, features_curr)
+
+    def _update_representation(self, train_loader, test_loader, 
+                                optimizer_stage1, scheduler_stage1,
+                                optimizer_stage2, scheduler_stage2):
+        # ========== 阶段1：训练新骨干 + fc + aux_fc ==========
         logging.info("=" * 50)
-        logging.info(f"CKA Similarity (Task {self._cur_task}): {cka_score:.4f}")
-        logging.info(f"CKA Threshold: {self.cka_threshold}")
-        
-        if cka_score > self.cka_threshold:
-            # 判定为冗余，丢弃新的骨干
-            logging.info(f"CKA score ({cka_score:.4f}) > threshold ({self.cka_threshold}): REDUNDANT!")
-            logging.info("Discarding the new convnet...")
-            
-            # 删除新添加的骨干
-            self._network.convnets.pop()
-            
-            # 恢复 fc（因为旧的 fc 已经复制了新类权重到错误的位置）
-            # 重新生成 fc，保留之前有效的部分
-            old_fc_weight = self._network.fc.weight.data.clone()
-            old_fc_bias = self._network.fc.bias.data.clone()
-            old_out_features = self._network.fc.out_features
-            
-            # 重新生成 fc
-            new_fc = self._network.generate_fc(
-                self._network.feature_dim, old_out_features
-            ).to(self._device)
-            
-            # 复制回原有权重（不需要新类的权重了）
-            # 旧类权重位置保持不变
-            self._network.fc = new_fc
-            self._network.fc.weight.data = old_fc_weight
-            self._network.fc.bias.data = old_fc_bias
-            
-            # 更新 task_sizes（撤销新任务的添加）
-            if len(self._network.task_sizes) > 0:
-                self._network.task_sizes.pop()
-            
-            # 清理临时保存的骨干
-            del self._temp_convnet
-            self._temp_convnet = None
-            
-            logging.info(f"Convnets count after discard: {len(self._network.convnets)}")
-            logging.info(f"Feature dimension: {self._network.feature_dim}")
-        else:
-            # 判定为有效新增，保留
-            logging.info(f"CKA score ({cka_score:.4f}) <= threshold ({self.cka_threshold}): VALID!")
-            logging.info("Keeping the new convnet.")
-            
-            # 清理临时引用
-            self._temp_convnet = None
-        
+        logging.info("Stage 1: Training convnet + fc + aux_fc")
         logging.info("=" * 50)
+        
+        # 保存阶段1开始时的fc状态（用于CKA检测后恢复）
+        fc_state_before_s1 = {
+            'weight': self._network.fc.weight.data.clone(),
+            'bias': self._network.fc.bias.data.clone() if self._network.fc.bias is not None else None,
+            'out_features': self._network.fc.out_features
+        }
+        
+        prog_bar = tqdm(range(epochs))
+        for _, epoch in enumerate(prog_bar):
+            self.train()
+            losses = 0.0
+            correct, total = 0, 0
+            
+            for _, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
+                outputs = self._network(inputs)
+                logits = outputs["logits"]
+                
+                loss = F.cross_entropy(logits, targets.long())
+                
+                optimizer_stage1.zero_grad()
+                loss.backward()
+                optimizer_stage1.step()
+                
+                losses += loss.item()
+                _, preds = torch.max(logits, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+
+            scheduler_stage1.step()
+            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            
+            if epoch % 5 == 0:
+                test_acc = self._compute_accuracy(self._network, test_loader)
+                info = "Task {}, Stage1 Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    epochs,
+                    losses / len(train_loader),
+                    train_acc,
+                    test_acc,
+                )
+            else:
+                info = "Task {}, Stage1 Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    epochs,
+                    losses / len(train_loader),
+                    train_acc,
+                )
+            prog_bar.set_description(info)
+        logging.info(info)
+
+        # ========== CKA 检测 ==========
+        if self._cur_task > 0:
+            cka_score = self._compute_cka_similarity(train_loader)
+            
+            logging.info("=" * 50)
+            logging.info(f"CKA Similarity (Task {self._cur_task}): {cka_score:.4f}")
+            logging.info(f"CKA Threshold: {self.cka_threshold}")
+            
+            if cka_score > self.cka_threshold:
+                # 判定为冗余，丢弃新骨干
+                logging.info(f"CKA score ({cka_score:.4f}) > threshold ({self.cka_threshold}): REDUNDANT!")
+                logging.info("Discarding the new convnet...")
+                
+                # 删除新添加的骨干
+                self._network.convnets.pop()
+                
+                # 恢复 fc 到阶段1开始时的状态
+                new_fc = self._network.generate_fc(
+                    self._network.feature_dim, fc_state_before_s1['out_features']
+                ).to(self._device)
+                new_fc.weight.data = fc_state_before_s1['weight']
+                if fc_state_before_s1['bias'] is not None:
+                    new_fc.bias.data = fc_state_before_s1['bias']
+                self._network.fc = new_fc
+                
+                # 更新 task_sizes
+                if len(self._network.task_sizes) > 0:
+                    self._network.task_sizes.pop()
+                    
+                logging.info(f"Convnets count after discard: {len(self._network.convnets)}")
+                logging.info(f"Feature dimension: {self._network.feature_dim}")
+            else:
+                logging.info(f"CKA score ({cka_score:.4f}) <= threshold ({self.cka_threshold}): VALID!")
+                logging.info("Keeping the new convnet.")
+            logging.info("=" * 50)
+
+        # ========== 阶段2：重新初始化 fc，只训练 fc ==========
+        logging.info("=" * 50)
+        logging.info("Stage 2: Reinitializing fc, training fc only")
+        logging.info("=" * 50)
+        
+        # 重新初始化 fc
+        self._network.fc = self._network.generate_fc(
+            self._network.feature_dim, self._total_classes
+        ).to(self._device)
+        
+        # 重新创建阶段2优化器（只包含新的 fc）
+        optimizer_stage2.param_groups = []
+        optimizer_stage2.add_param_group(
+            {'params': filter(lambda p: p.requires_grad, self._network.fc.parameters())}
+        )
+        # 重置 scheduler 的 milestones
+        scheduler_stage2 = optim.lr_scheduler.MultiStepLR(
+            optimizer=optimizer_stage2, milestones=milestones, gamma=lrate_decay
+        )
+        
+        prog_bar = tqdm(range(epochs))
+        for _, epoch in enumerate(prog_bar):
+            self.train()
+            losses = 0.0
+            correct, total = 0, 0
+            
+            for _, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
+                outputs = self._network(inputs)
+                logits = outputs["logits"]
+                
+                loss = F.cross_entropy(logits, targets.long())
+                
+                optimizer_stage2.zero_grad()
+                loss.backward()
+                optimizer_stage2.step()
+                
+                losses += loss.item()
+                _, preds = torch.max(logits, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+
+            scheduler_stage2.step()
+            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            
+            if epoch % 5 == 0:
+                test_acc = self._compute_accuracy(self._network, test_loader)
+                info = "Task {}, Stage2 Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    epochs,
+                    losses / len(train_loader),
+                    train_acc,
+                    test_acc,
+                )
+            else:
+                info = "Task {}, Stage2 Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    epochs,
+                    losses / len(train_loader),
+                    train_acc,
+                )
+            prog_bar.set_description(info)
+        logging.info(info)
