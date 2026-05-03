@@ -154,7 +154,7 @@ def _train(args):
         logging.info('Accuracy Matrix (CNN):')
         np.savetxt(fname=logfilename + "CNN_acctable.csv", X=np_acctable, delimiter=",")
         logging.info(np_acctable)
-        logging.info('Forgetting (CNN):', forgetting)
+        # logging.info('Forgetting (CNN):', forgetting)
         logging.info('Forgetting (CNN): {}'.format(forgetting))
     if len(nme_matrix)>0:
         np_acctable = np.zeros([task + 1, task + 1])
@@ -166,7 +166,7 @@ def _train(args):
         logging.info('Accuracy Matrix (NME):')
         np.savetxt(fname=logfilename + "NME_acctable.csv", X=np_acctable, delimiter=",")
         logging.info(np_acctable)
-        logging.info('Forgetting (NME):', forgetting)
+        # logging.info('Forgetting (NME):', forgetting)
         logging.info('Forgetting (NME): {}'.format(forgetting))
 
 
