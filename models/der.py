@@ -860,7 +860,11 @@ class DER_KL(DER):
         
         # 转换数据格式
         if isinstance(memory_x, np.ndarray):
-            memory_x = torch.from_numpy(memory_x)
+            # numpy 数组格式是 (N, H, W, C)，需要转换为 (N, C, H, W)
+            if memory_x.ndim == 4:
+                memory_x = torch.from_numpy(memory_x).permute(0, 3, 1, 2).float()
+            else:
+                memory_x = torch.from_numpy(memory_x).float()
         if isinstance(memory_y, np.ndarray):
             memory_y = torch.from_numpy(memory_y)
         
