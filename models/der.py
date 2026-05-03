@@ -359,44 +359,59 @@ class DER_A(DER):
 
     def _compute_cka_similarity(self, data_loader):
         """
-        计算新骨干与上一个骨干的 CKA 相似度
+        计算新骨干与所有历史骨干的 CKA 相似度
+        返回：与所有历史骨干的最大CKA值
         """
         if len(self._network.convnets) < 2:
             return 0.0
         
         self._network.eval()
-        features_prev = []
-        features_curr = []
         
+        # 收集所有样本的特征
         with torch.no_grad():
+            all_inputs = []
             for _, (_, inputs, _) in enumerate(data_loader):
-                inputs = inputs.to(self._device)
-                
-                # 提取前一个骨干的特征
-                feat_prev = self._network.convnets[-2](inputs)["features"]
-                features_prev.append(feat_prev)
-                
-                # 提取当前骨干的特征
-                feat_curr = self._network.convnets[-1](inputs)["features"]
-                features_curr.append(feat_curr)
+                all_inputs.append(inputs.to(self._device))
+            all_inputs = torch.cat(all_inputs, dim=0)
         
-        features_prev = torch.cat(features_prev, dim=0)
-        features_curr = torch.cat(features_curr, dim=0)
-        
-        # 如果特征维度不同，对齐到相同维度
-        if features_prev.shape[1] != features_curr.shape[1]:
-            min_dim = min(features_prev.shape[1], features_curr.shape[1])
-            features_prev = features_prev[:, :min_dim]
-            features_curr = features_curr[:, :min_dim]
-        
-        # 随机采样计算 CKA
+        # 随机采样
         max_samples = 1000
-        if len(features_prev) > max_samples:
-            indices = torch.randperm(len(features_prev))[:max_samples]
-            features_prev = features_prev[indices]
-            features_curr = features_curr[indices]
+        if len(all_inputs) > max_samples:
+            indices = torch.randperm(len(all_inputs))[:max_samples]
+            sampled_inputs = all_inputs[indices]
+        else:
+            sampled_inputs = all_inputs
         
-        return compute_cka(features_prev, features_curr)
+        # 获取当前新骨干的特征
+        features_curr = self._network.convnets[-1](sampled_inputs)["features"]
+        
+        # 与所有历史骨干分别计算CKA
+        cka_scores = []
+        num_historical = len(self._network.convnets) - 1
+        
+        logging.info("-" * 50)
+        logging.info(f"CKA Analysis: New Convnet vs {num_historical} Historical Convnets")
+        logging.info("-" * 50)
+        
+        for i, convnet in enumerate(self._network.convnets[:-1]):
+            features_prev = convnet(sampled_inputs)["features"]
+            
+            # 如果特征维度不同，对齐到相同维度
+            if features_prev.shape[1] != features_curr.shape[1]:
+                min_dim = min(features_prev.shape[1], features_curr.shape[1])
+                features_prev = features_prev[:, :min_dim]
+                features_curr = features_curr[:, :min_dim]
+            
+            cka = compute_cka(features_prev, features_curr)
+            cka_scores.append(cka)
+            logging.info(f"  CKA(convnet_new, convnet_{i}): {cka:.4f}")
+        
+        logging.info("-" * 50)
+        logging.info(f"Max CKA: {max(cka_scores):.4f}, Mean CKA: {sum(cka_scores)/len(cka_scores):.4f}")
+        logging.info("-" * 50)
+        
+        # 返回最大CKA值（最严格的判断）
+        return max(cka_scores)
 
     def _update_representation(self, train_loader, test_loader, 
                                 optimizer_stage1, scheduler_stage1,
@@ -464,8 +479,7 @@ class DER_A(DER):
             cka_score = self._compute_cka_similarity(train_loader)
             
             logging.info("=" * 50)
-            logging.info(f"CKA Similarity (Task {self._cur_task}): {cka_score:.4f}")
-            logging.info(f"CKA Threshold: {self.cka_threshold}")
+            logging.info(f"Task {self._cur_task} CKA Decision: max_cka={cka_score:.4f}, threshold={self.cka_threshold}")
             
             if cka_score > self.cka_threshold:
                 # 判定为冗余，丢弃新骨干
