@@ -9,7 +9,45 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from models.base import BaseLearner
 from utils.inc_net import DERNet, IncrementalNet
-from utils.toolkit import count_parameters, target2onehot, tensor2numpy
+from utils.toolkit import count_parameters, tensor2numpy
+
+
+def compute_cka(features1, features2):
+    """
+    计算 Linear CKA (Centered Kernel Alignment) 相似度
+    基于 Gram 矩阵的 Frobenius 范数
+    
+    参考: Kornblith et al., ICML 2019
+    
+    Args:
+        features1: 特征张量 (N, D1)
+        features2: 特征张量 (N, D2)
+    
+    Returns:
+        CKA 相似度分数
+    """
+    # 中心化处理
+    features1 = features1 - features1.mean(dim=0, keepdim=True)
+    features2 = features2 - features2.mean(dim=0, keepdim=True)
+    
+    # 计算 Gram 矩阵
+    gram1 = torch.mm(features1, features1.t())  # (N, N)
+    gram2 = torch.mm(features2, features2.t())  # (N, N)
+    
+    # 中心化 Gram 矩阵 (HSIC 的无偏估计)
+    n = gram1.size(0)
+    trace = torch.trace
+    centering = torch.eye(n, n, device=gram1.device) - torch.ones(n, n, device=gram1.device) / n
+    
+    hsic = trace(torch.mm(torch.mm(gram1, centering), gram2))
+    
+    # 归一化
+    var1 = trace(torch.mm(torch.mm(gram1, centering), gram1))
+    var2 = trace(torch.mm(torch.mm(gram2, centering), gram2))
+    
+    cka = hsic / (torch.sqrt(var1 * var2) + 1e-10)
+    
+    return cka.item()
 
 EPSILON = 1e-8
 
@@ -305,5 +343,178 @@ class DER(BaseLearner):
 
 
 class DER_A(DER):
+    """
+    DER with CKA-based Dynamic Expansion
+    
+    基于 CKA (Centered Kernel Alignment) 的动态扩展机制：
+    - 训练完新的特征提取器后，计算其与上一阶段提取器的 CKA 相似度
+    - 若 CKA > threshold：判定为冗余，丢弃新的特征提取器
+    - 若 CKA <= threshold：判定为有效新增，保留并执行后续剪枝
+    """
     def __init__(self, args):
         super().__init__(args)
+        # CKA 阈值：超过此值则判定为冗余
+        self.cka_threshold = args.get('cka_threshold', 0.85)
+        self._temp_convnet = None  # 临时保存训练后的新骨干
+        logging.info(f"CKA threshold: {self.cka_threshold}")
+
+    def incremental_train(self, data_manager):
+        self._cur_task += 1
+        self._total_classes = self._known_classes + data_manager.get_task_size(
+            self._cur_task
+        )
+        
+        # 记录当前 convnets 数量
+        num_convnets_before = len(self._network.convnets)
+        
+        self._network.update_fc(self._total_classes)
+        
+        # 保存新添加的 convnet 的引用（用于 CKA 检测）
+        if len(self._network.convnets) > num_convnets_before:
+            self._temp_convnet = self._network.convnets[-1]
+        
+        logging.info(
+            "Learning on {}-{}".format(self._known_classes, self._total_classes)
+        )
+
+        if self._cur_task > 0:
+            for i in range(self._cur_task):
+                for p in self._network.convnets[i].parameters():
+                    p.requires_grad = False
+
+        logging.info("All params: {}".format(count_parameters(self._network)))
+        logging.info(
+            "Trainable params: {}".format(count_parameters(self._network, True))
+        )
+
+        train_dataset = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+            mode="train",
+            appendent=self._get_memory(),
+        )
+        self.train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=self._num_workers
+        )
+        test_dataset = data_manager.get_dataset(
+            np.arange(0, self._total_classes), source="test", mode="test"
+        )
+        self.test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False, num_workers=self._num_workers
+        )
+
+        if len(self._multiple_gpus) > 1:
+            self._network = nn.DataParallel(self._network, self._multiple_gpus)
+        
+        self._train(self.train_loader, self.test_loader)
+        
+        # ========== CKA-based Dynamic Expansion ==========
+        self._apply_cka_discard()
+        
+        self.build_rehearsal_memory(data_manager, self.samples_per_class)
+        if len(self._multiple_gpus) > 1:
+            self._network = self._network.module
+
+    def _apply_cka_discard(self):
+        """
+        计算训练后新骨干与上一个骨干的 CKA 相似度，
+        如果高于阈值则丢弃新的骨干
+        """
+        if self._cur_task == 0 or self._temp_convnet is None:
+            self._temp_convnet = None
+            return
+        
+        # 需要比较的骨干索引
+        if len(self._network.convnets) < 2:
+            self._temp_convnet = None
+            return
+        
+        # 获取当前任务的数据用于提取特征
+        eval_loader = self.test_loader
+        
+        # 提取特征
+        features_prev = []
+        features_curr = []
+        
+        self._network.eval()
+        
+        with torch.no_grad():
+            for _, (_, inputs, _) in enumerate(eval_loader):
+                inputs = inputs.to(self._device)
+                
+                # 提取前一个骨干的特征
+                feat_prev = self._network.convnets[-2](inputs)["features"]
+                features_prev.append(feat_prev)
+                
+                # 提取当前骨干的特征
+                feat_curr = self._network.convnets[-1](inputs)["features"]
+                features_curr.append(feat_curr)
+        
+        features_prev = torch.cat(features_prev, dim=0)
+        features_curr = torch.cat(features_curr, dim=0)
+        
+        # 如果特征维度不同，使用全局平均池化对齐
+        if features_prev.shape[1] != features_curr.shape[1]:
+            # 对齐到相同维度
+            min_dim = min(features_prev.shape[1], features_curr.shape[1])
+            features_prev = features_prev[:, :min_dim]
+            features_curr = features_curr[:, :min_dim]
+        
+        # 随机采样一部分特征计算 CKA（避免显存问题）
+        max_samples = 1000
+        if len(features_prev) > max_samples:
+            indices = torch.randperm(len(features_prev))[:max_samples]
+            features_prev = features_prev[indices]
+            features_curr = features_curr[indices]
+        
+        # 计算 CKA
+        cka_score = compute_cka(features_prev, features_curr)
+        
+        logging.info("=" * 50)
+        logging.info(f"CKA Similarity (Task {self._cur_task}): {cka_score:.4f}")
+        logging.info(f"CKA Threshold: {self.cka_threshold}")
+        
+        if cka_score > self.cka_threshold:
+            # 判定为冗余，丢弃新的骨干
+            logging.info(f"CKA score ({cka_score:.4f}) > threshold ({self.cka_threshold}): REDUNDANT!")
+            logging.info("Discarding the new convnet...")
+            
+            # 删除新添加的骨干
+            self._network.convnets.pop()
+            
+            # 恢复 fc（因为旧的 fc 已经复制了新类权重到错误的位置）
+            # 重新生成 fc，保留之前有效的部分
+            old_fc_weight = self._network.fc.weight.data.clone()
+            old_fc_bias = self._network.fc.bias.data.clone()
+            old_out_features = self._network.fc.out_features
+            
+            # 重新生成 fc
+            new_fc = self._network.generate_fc(
+                self._network.feature_dim, old_out_features
+            ).to(self._device)
+            
+            # 复制回原有权重（不需要新类的权重了）
+            # 旧类权重位置保持不变
+            self._network.fc = new_fc
+            self._network.fc.weight.data = old_fc_weight
+            self._network.fc.bias.data = old_fc_bias
+            
+            # 更新 task_sizes（撤销新任务的添加）
+            if len(self._network.task_sizes) > 0:
+                self._network.task_sizes.pop()
+            
+            # 清理临时保存的骨干
+            del self._temp_convnet
+            self._temp_convnet = None
+            
+            logging.info(f"Convnets count after discard: {len(self._network.convnets)}")
+            logging.info(f"Feature dimension: {self._network.feature_dim}")
+        else:
+            # 判定为有效新增，保留
+            logging.info(f"CKA score ({cka_score:.4f}) <= threshold ({self.cka_threshold}): VALID!")
+            logging.info("Keeping the new convnet.")
+            
+            # 清理临时引用
+            self._temp_convnet = None
+        
+        logging.info("=" * 50)

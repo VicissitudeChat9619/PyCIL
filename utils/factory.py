@@ -18,6 +18,9 @@ def get_model(model_name, args):
     elif name == "wa":
         from models.wa import WA
         return WA(args)
+    elif name == "der_a":
+        from models.der import DER_A
+        return DER(args)
     elif name == "der":
         from models.der import DER
         return DER(args)
