@@ -918,7 +918,7 @@ class DER_KL(DER):
                 features_new = torch.cat(features_new, dim=1)
                 
                 # 计算新路径 logits
-                logits_new = self._network.fc(features_new)
+                logits_new = self._network.fc(features_new)["logits"]
                 
                 # 应用温度缩放的 softmax
                 p_old = F.softmax(logits_old / T, dim=-1)
