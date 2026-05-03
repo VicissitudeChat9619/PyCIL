@@ -78,8 +78,7 @@ def _train(args):
 
 
         ## confusion matrix output
-        # if task==0:
-        # y_pred,y_true=model._eval_cnn(model.test_loader)
+        # if task==0: # FOR test
         y_pred,y_true=y_pred_cnn,y_true_cnn
         logging.info(f"{y_pred.shape},{y_true.shape}")
         confusion_matrix = get_confusion_matrix(y_pred,y_true)
@@ -121,8 +120,8 @@ def _train(args):
             logging.info("NME top1 curve: {}".format(nme_curve["top1"]))
             logging.info("NME top5 curve: {}\n".format(nme_curve["top5"]))
 
-            logging.info('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
-            logging.info('Average Accuracy (NME):', sum(nme_curve["top1"])/len(nme_curve["top1"]))
+            # logging.info('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
+            # logging.info('Average Accuracy (NME):', sum(nme_curve["top1"])/len(nme_curve["top1"]))
 
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
