@@ -890,6 +890,9 @@ class DER_KL(DER):
         logging.info(f"  All convnets: {len(self._network.convnets)}")
         logging.info("-" * 50)
         
+        # 旧类别数量
+        num_old_classes = self._known_classes
+        
         with torch.no_grad():
             for _, (inputs, _) in enumerate(loader):
                 inputs = inputs.to(self._device)
@@ -903,10 +906,10 @@ class DER_KL(DER):
                 features_old = torch.cat(features_old, dim=1)  # (N, old_feature_dim)
                 
                 # 使用 fc 的旧权重部分（不包含新特征提取器对应的权重）
-                old_weight_part = old_fc_weight[:, :old_feature_dim]
-                old_bias_part = old_fc_bias[:old_weight_part.shape[0]]
+                old_weight_part = old_fc_weight[:num_old_classes, :old_feature_dim]
+                old_bias_part = old_fc_bias[:num_old_classes]
                 
-                # 计算旧路径 logits
+                # 计算旧路径 logits（只取旧类别部分）
                 logits_old = torch.mm(features_old, old_weight_part.t()) + old_bias_part
                 
                 # ========== 新路径 ==========
@@ -917,8 +920,8 @@ class DER_KL(DER):
                     features_new.append(feat)
                 features_new = torch.cat(features_new, dim=1)
                 
-                # 计算新路径 logits
-                logits_new = self._network.fc(features_new)["logits"]
+                # 计算新路径 logits（只取旧类别部分）
+                logits_new = self._network.fc(features_new)["logits"][:, :num_old_classes]
                 
                 # 应用温度缩放的 softmax
                 p_old = F.softmax(logits_old / T, dim=-1)
