@@ -52,13 +52,13 @@ class Finetune(BaseLearner):
             mode="train",
         )
         self.train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=self._num_workers
         )
         test_dataset = data_manager.get_dataset(
             np.arange(0, self._total_classes), source="test", mode="test"
         )
         self.test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+            test_dataset, batch_size=batch_size, shuffle=False, num_workers=self._num_workers
         )
 
         if len(self._multiple_gpus) > 1:
@@ -102,7 +102,7 @@ class Finetune(BaseLearner):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
                 logits = self._network(inputs)["logits"]
 
-                loss = F.cross_entropy(logits, targets)
+                loss = F.cross_entropy(logits, targets.long())
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
