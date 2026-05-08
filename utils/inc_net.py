@@ -1262,3 +1262,156 @@ class TSAttention(nn.Module):
         feat = feat.transpose(1, 2).flatten(2)
 
         return feat
+
+
+class DERLiteNet(nn.Module):
+    """
+    DER-Lite v5: Multi-scale adapters for richer task-specific features.
+    
+    Uses MultiScaleTaskAdapter (~64K params per task, ~7x less than a full
+    ResNet backbone) operating on all 3 backbone feature map scales.
+    Backbone stays frozen after task 0 (no trainable backbone params per task).
+    
+    Parameter growth: ~7x reduction vs original DER per task.
+    Total params (10 tasks): ~1.1M vs DER's 4.7M.
+    """
+    def __init__(self, args, pretrained):
+        super(DERLiteNet, self).__init__()
+        
+        self.convnet_type = args["convnet_type"]
+        self.pretrained = pretrained
+        self.out_dim = None
+        self.fc = None
+        self.aux_fc = None
+        self.task_sizes = []
+        self.args = args
+        
+        # Single base backbone (trained at task 0, frozen afterward)
+        self.backbone = None
+        
+        # Multi-scale adapters (one per incremental task)
+        self.adapters = nn.ModuleList()
+        
+        # Adapter configuration
+        self.adapter_dim = args.get('adapter_dim', 128)
+        self.adapter_common_dim = args.get('adapter_common_dim', 128)
+        
+        # Detect backbone to set correct fmaps channel list
+        if 'resnet32' in self.convnet_type:
+            self._fmap_channels = (16, 32, 64)
+        else:
+            self._fmap_channels = (64, 128, 256, 512)  # ResNet18/34/50 for ImageNet
+    
+    @property
+    def feature_dim(self):
+        if self.out_dim is None:
+            return 0
+        adapter_dims = sum(self.adapter_dim for _ in self.adapters)
+        return self.out_dim + adapter_dims
+    
+    def extract_vector(self, x):
+        backbone_out = self.backbone(x)
+        base_features = backbone_out["features"]
+        adapter_features = []
+        fmaps = backbone_out['fmaps']
+        for adapter in self.adapters:
+            adapter_features.append(adapter(fmaps))
+        if adapter_features:
+            return torch.cat([base_features] + adapter_features, dim=1)
+        return base_features
+    
+    def forward(self, x):
+        backbone_out = self.backbone(x)
+        base_features = backbone_out["features"]
+        fmaps = backbone_out['fmaps']  # [fmap1, fmap2, fmap3]
+        
+        # Collect features from multi-scale adapters
+        features_list = [base_features]
+        for adapter in self.adapters:
+            adapter_features = adapter(fmaps)
+            features_list.append(adapter_features)
+        
+        all_features = torch.cat(features_list, dim=1)
+        
+        # Main FC logits
+        out = self.fc(all_features)
+        
+        # Aux FC logits (from latest adapter features only)
+        if len(self.adapters) > 0:
+            aux_features = features_list[-1]
+            aux_logits = self.aux_fc(aux_features)["logits"]
+        else:
+            aux_logits = None
+        
+        out.update({"aux_logits": aux_logits, "features": all_features})
+        return out
+    
+    def update_fc(self, nb_classes):
+        from convs.der_lite_adapter import MultiScaleTaskAdapter
+        
+        if self.backbone is None:
+            self.backbone = get_convnet(self.args)
+            self.out_dim = self.backbone.out_dim
+        
+        if len(self.task_sizes) > 0:
+            adapter = MultiScaleTaskAdapter(
+                in_channels_list=self._fmap_channels,
+                common_dim=self.adapter_common_dim,
+                out_dim=self.adapter_dim
+            )
+            self.adapters.append(adapter)
+        
+        fc = self.generate_fc(self.feature_dim, nb_classes)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output, :self.fc.in_features] = weight
+            fc.bias.data[:nb_output] = bias
+        
+        del self.fc
+        self.fc = fc
+        
+        new_task_size = nb_classes - sum(self.task_sizes)
+        self.task_sizes.append(new_task_size)
+        
+        self.aux_fc = self.generate_fc(self.adapter_dim, len(self.task_sizes))
+    
+    def generate_fc(self, in_dim, out_dim):
+        from convs.linears import SimpleLinear
+        fc = SimpleLinear(in_dim, out_dim)
+        return fc
+    
+    def copy(self):
+        return copy.deepcopy(self)
+    
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        return self
+    
+    def freeze_backbone(self):
+        """Freeze backbone after task 0."""
+        if self.backbone is not None:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            self.backbone.eval()
+    
+    def weight_align(self, increment):
+        weights = self.fc.weight.data
+        newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
+        oldnorm = torch.norm(weights[:-increment, :], p=2, dim=1)
+        meannew = torch.mean(newnorm)
+        meanold = torch.mean(oldnorm)
+        gamma = meanold / meannew
+        print("alignweights,gamma=", gamma)
+        self.fc.weight.data[-increment:, :] *= gamma
+    
+    def load_checkpoint(self, args):
+        checkpoint_name = f"checkpoints/finetune_{args['csv_name']}_0.pkl"
+        model_infos = torch.load(checkpoint_name)
+        self.backbone.load_state_dict(model_infos['convnet'])
+        self.fc.load_state_dict(model_infos['fc'])
+        test_acc = model_infos['test_acc']
+        return test_acc
