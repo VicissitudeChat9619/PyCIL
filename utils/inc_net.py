@@ -1415,3 +1415,140 @@ class DERLiteNet(nn.Module):
         self.fc.load_state_dict(model_infos['fc'])
         test_acc = model_infos['test_acc']
         return test_acc
+
+
+class BranchHead(nn.Module):
+    def __init__(self, last_layer, avgpool, out_dim):
+        super().__init__()
+        self.last_layer = last_layer
+        self.avgpool = avgpool
+        self.out_dim = out_dim
+
+    def forward(self, x):
+        x = self.last_layer(x)
+        x = self.avgpool(x)
+        features = torch.flatten(x, 1)
+        return {"features": features}
+
+
+class PDERNet(nn.Module):
+    def __init__(self, args, pretrained):
+        super(PDERNet, self).__init__()
+        self.convnet_type = args["convnet_type"]
+        self.convnets = nn.ModuleList()
+        self.pretrained = pretrained
+        self.out_dim = None
+        self.fc = None
+        self.aux_fc = None
+        self.task_sizes = []
+        self.args = args
+        self.trunk = None
+
+    @property
+    def feature_dim(self):
+        if self.out_dim is None:
+            return 0
+        return self.out_dim * len(self.convnets)
+
+    def _split_convnet(self, full_convnet):
+        if "resnet32" in self.convnet_type:
+            trunk = nn.Sequential(
+                full_convnet.conv_1_3x3,
+                full_convnet.bn_1,
+                nn.ReLU(inplace=True),
+                full_convnet.stage_1,
+                full_convnet.stage_2,
+            )
+            branch = BranchHead(full_convnet.stage_3, full_convnet.avgpool, full_convnet.out_dim)
+        else:
+            trunk = nn.Sequential(
+                full_convnet.conv1,
+                full_convnet.layer1,
+                full_convnet.layer2,
+                full_convnet.layer3,
+            )
+            branch = BranchHead(full_convnet.layer4, full_convnet.avgpool, full_convnet.out_dim)
+        return trunk, branch
+
+    def extract_vector(self, x):
+        trunk_out = self.trunk(x)
+        features = [branch(trunk_out)["features"] for branch in self.convnets]
+        features = torch.cat(features, 1)
+        return features
+
+    def forward(self, x):
+        trunk_out = self.trunk(x)
+        features = [branch(trunk_out)["features"] for branch in self.convnets]
+        features = torch.cat(features, 1)
+
+        out = self.fc(features)
+        aux_logits = self.aux_fc(features[:, -self.out_dim:])["logits"]
+        out.update({"aux_logits": aux_logits, "features": features})
+        return out
+
+    def update_fc(self, nb_classes):
+        if len(self.convnets) == 0:
+            full_convnet = get_convnet(self.args)
+            self.trunk, first_branch = self._split_convnet(full_convnet)
+            self.convnets.append(first_branch)
+        else:
+            self.convnets.append(copy.deepcopy(self.convnets[-1]))
+
+        if self.out_dim is None:
+            self.out_dim = self.convnets[-1].out_dim
+        fc = self.generate_fc(self.feature_dim, nb_classes)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output, :self.feature_dim - self.out_dim] = weight
+            fc.bias.data[:nb_output] = bias
+
+        del self.fc
+        self.fc = fc
+
+        new_task_size = nb_classes - sum(self.task_sizes)
+        self.task_sizes.append(new_task_size)
+
+        self.aux_fc = self.generate_fc(self.out_dim, new_task_size + 1)
+
+    def generate_fc(self, in_dim, out_dim):
+        fc = SimpleLinear(in_dim, out_dim)
+        return fc
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        return self
+
+    def freeze_conv(self):
+        for param in self.convnets.parameters():
+            param.requires_grad = False
+        self.convnets.eval()
+
+    def weight_align(self, increment):
+        weights = self.fc.weight.data
+        newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
+        oldnorm = torch.norm(weights[:-increment, :], p=2, dim=1)
+        meannew = torch.mean(newnorm)
+        meanold = torch.mean(oldnorm)
+        gamma = meanold / meannew
+        print("alignweights,gamma=", gamma)
+        self.fc.weight.data[-increment:, :] *= gamma
+
+    def load_checkpoint(self, args):
+        checkpoint_name = f"checkpoints/finetune_{args['csv_name']}_0.pkl"
+        model_infos = torch.load(checkpoint_name)
+        full_convnet = get_convnet(self.args)
+        self.trunk, first_branch = self._split_convnet(full_convnet)
+        assert len(self.convnets) == 0
+        self.convnets.append(first_branch)
+        self.out_dim = self.convnets[0].out_dim
+        self.convnets[0].load_state_dict(model_infos["convnet"])
+        self.fc.load_state_dict(model_infos["fc"])
+        test_acc = model_infos["test_acc"]
+        return test_acc

@@ -33,6 +33,9 @@ def get_model(model_name, args):
     elif name == "der_lite":
         from models.der_lite import DER_Lite
         return DER_Lite(args)
+    elif name == "pder":
+        from models.pder import PDER
+        return PDER(args)
     elif name == "der":
         from models.der import DER
         return DER(args)
