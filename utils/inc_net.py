@@ -1417,6 +1417,57 @@ class DERLiteNet(nn.Module):
         return test_acc
 
 
+class DERLiteNetV7(DERLiteNet):
+    """
+    DER-Lite V7: deeper adapters with per-scale two-layer conv projections
+    and residual fusion MLP.
+
+    Differences from V5:
+      - Uses DeeperTaskAdapter (~200K params) instead of
+        MultiScaleTaskAdapter (~64K)
+      - Two 1x1 conv layers per fmap scale (in_c -> hidden -> out_per_scale)
+      - Two-layer fusion MLP instead of one
+      - Adapter params per task: ~200K (3x V5, still 11x less than pDER)
+    """
+
+    def __init__(self, args, pretrained):
+        super().__init__(args, pretrained)
+        self.adapter_common_dim = args.get("adapter_common_dim", 192)
+        self.adapter_hidden_scale = args.get("adapter_hidden_scale", 64)
+
+    def update_fc(self, nb_classes):
+        from convs.der_lite_adapter import DeeperTaskAdapter
+
+        if self.backbone is None:
+            self.backbone = get_convnet(self.args)
+            self.out_dim = self.backbone.out_dim
+
+        if len(self.task_sizes) > 0:
+            adapter = DeeperTaskAdapter(
+                in_channels_list=self._fmap_channels,
+                common_dim=self.adapter_common_dim,
+                out_dim=self.adapter_dim,
+                hidden_scale=self.adapter_hidden_scale,
+            )
+            self.adapters.append(adapter)
+
+        fc = self.generate_fc(self.feature_dim, nb_classes)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output, :self.fc.in_features] = weight
+            fc.bias.data[:nb_output] = bias
+
+        del self.fc
+        self.fc = fc
+
+        new_task_size = nb_classes - sum(self.task_sizes)
+        self.task_sizes.append(new_task_size)
+
+        self.aux_fc = self.generate_fc(self.adapter_dim, len(self.task_sizes))
+
+
 class BranchHead(nn.Module):
     def __init__(self, last_layer, avgpool, out_dim):
         super().__init__()

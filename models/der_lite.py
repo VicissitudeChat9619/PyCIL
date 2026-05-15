@@ -493,3 +493,28 @@ class DER_Lite_V6(DER_Lite):
             self._network_module_ptr.adapters[-1].train()
             self._network_module_ptr.fc.train()
             self._network_module_ptr.aux_fc.train()
+
+
+# ---------------------------------------------------------------------------
+# DER-Lite V7: Deeper adapters + KD
+# ---------------------------------------------------------------------------
+
+class DER_Lite_V7(DER_Lite):
+    """
+    DER-Lite V7: deeper per-scale adapter processing with residual fusion.
+
+    Key improvements over V5:
+      - DeeperTaskAdapter (~200K params per task vs 64K)
+      - Two-layer 1x1 conv projections per fmap scale
+      - Two-layer fusion MLP for richer feature combination
+      - Inherits KD loss + frozen backbone from DER_Lite
+
+    Per-task trainable: ~210K (adapter ~200K + FC expansion + aux_fc)
+      vs V5's ~75K, pDER's 2.3M, DER's 11.2M
+    """
+
+    def __init__(self, args):
+        super(DER_Lite, self).__init__(args)
+        from utils.inc_net import DERLiteNetV7
+        self._network = DERLiteNetV7(args, False)
+        self._old_network = None

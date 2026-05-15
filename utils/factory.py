@@ -27,6 +27,9 @@ def get_model(model_name, args):
     elif name == "der_a":
         from models.der import DER_A
         return DER_A(args)
+    elif name == "der_lite_v7":
+        from models.der_lite import DER_Lite_V7
+        return DER_Lite_V7(args)
     elif name == "der_lite_v6":
         from models.der_lite import DER_Lite_V6
         return DER_Lite_V6(args)
